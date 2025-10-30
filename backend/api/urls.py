@@ -1,4 +1,5 @@
 from django.urls import path
+from .views import QueryTfIdfAPIView
 from .views import RegisterView, MeView, DocumentListCreateView
 from rest_framework_simplejwt.views import (
     TokenObtainPairView,
@@ -14,4 +15,5 @@ urlpatterns = [
     path("auth/me/", MeView.as_view(), name="auth_me"),
      # Documents
     path("documents/", DocumentListCreateView.as_view(), name="documents_list_create"),
+    path("query_tfidf/", QueryTfIdfAPIView.as_view(), name="query_tfidf"),
 ]
