@@ -1,4 +1,7 @@
 # backend/api/views.py
+import pickle
+from scipy import sparse
+from sklearn.feature_extraction.text import TfidfVectorizer
 import os
 import json
 import numpy as np
@@ -11,6 +14,7 @@ from rest_framework import status
 
 from .serializers import RegisterSerializer, UserSerializer, DocumentSerializer
 from .models import Document
+
 
 # -------------------------
 # Auth views (register / me)
@@ -39,13 +43,7 @@ class DocumentListCreateView(generics.ListCreateAPIView):
 
     def perform_create(self, serializer):
         serializer.save(owner=self.request.user, status="uploaded")
-
-# -------------------------
-# TF-IDF query view (lightweight)
-# -------------------------
-from scipy import sparse
-from sklearn.feature_extraction.text import TfidfVectorizer
-
+        
 class QueryTfIdfAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -67,25 +65,25 @@ class QueryTfIdfAPIView(APIView):
             return Response({"detail":"Forbidden"}, status=status.HTTP_403_FORBIDDEN)
 
         tfidf_dir = os.path.join(settings.BASE_DIR, "tfidf_index")
-        mat_path = os.path.join(tfidf_dir, "matrix.npz")
-        vocab_path = os.path.join(tfidf_dir, "vectorizer_vocab.json")
-        meta_path = os.path.join(tfidf_dir, "metadata.json")
-        if not (os.path.exists(mat_path) and os.path.exists(vocab_path) and os.path.exists(meta_path)):
-            return Response({"detail":"TF-IDF index not available"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        base = f"doc_{doc.id}"
+        matrix_path = os.path.join(tfidf_dir, base + "_matrix.npz")
+        vect_path = os.path.join(tfidf_dir, base + "_vectorizer.pkl")
+        meta_path = os.path.join(tfidf_dir, base + "_metadata.json")
 
-        metadata = json.load(open(meta_path, "r", encoding="utf-8"))
-        vocab = json.load(open(vocab_path, "r", encoding="utf-8"))
-        X = sparse.load_npz(mat_path)
+        if not (os.path.exists(matrix_path) and os.path.exists(vect_path) and os.path.exists(meta_path)):
+            return Response({"detail":"TF-IDF index for this document is not available. Run ingestion."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        # build vectorizer with saved vocabulary, then fit on the saved chunks to set idf_
-        vectorizer = TfidfVectorizer(stop_words='english', vocabulary=vocab)
-        # metadata is a list of dicts saved earlier; build list of texts
-        texts = [m["text"] for m in metadata]
-        # fit vectorizer to compute idf_ (fast because texts are small)
-        vectorizer.fit(texts)
-        # now transform the question safely
-        q_vec = vectorizer.transform([question])  # shape (1, n_features)
-        scores = (q_vec.dot(X.T)).toarray()[0]
+        # load artifacts
+        try:
+            vectorizer = pickle.load(open(vect_path, "rb"))
+            X = sparse.load_npz(matrix_path)
+            metadata = json.load(open(meta_path, "r", encoding="utf-8"))
+        except Exception as e:
+            return Response({"detail": f"Failed to load index: {e}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # transform question and score
+        q_vec = vectorizer.transform([question])
+        scores = (q_vec.dot(X.T)).toarray()[0]  # shape (n_chunks,)
         ranked = np.argsort(-scores)
         hits = []
         for idx in ranked:
@@ -93,17 +91,50 @@ class QueryTfIdfAPIView(APIView):
                 continue
             item = metadata[idx]
             if item.get("doc_id") == doc.id:
-                hits.append({"score": float(scores[idx]), "page": item["page"], "text": item["text"]})
+                hits.append({
+                    "score": float(scores[idx]),
+                    "page": item.get("page"),
+                    "chunk_index": item.get("chunk_index"),
+                    "text": item.get("text")
+                })
             if len(hits) >= top_k:
                 break
 
-        # simple short summary from top hits (first sentence of each)
-        summary_lines = []
-        for h in hits[:3]:
-            snippet = h["text"]
-            sentence = snippet.split(".")[0].strip()
-            if sentence:
-                summary_lines.append(sentence)
-        summary = " • ".join(summary_lines) if summary_lines else ""
+        # ------------------------
+        # Build a short, clean answer (generic)
+        # ------------------------
+        import re
+        def clean_text_for_display(s: str) -> str:
+            if not s:
+                return ""
+            s = re.sub(r"\(cid:\d+\)", " ", s)
+            s = re.sub(r"[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]+", " ", s)
+            s = re.sub(r"\s+", " ", s).strip()
+            return s
+
+        if not hits:
+            # no TF-IDF hits: return empty answer (caller can try rephrasing)
+            return Response({"answer": "", "hits": []})
+
+        # prefer sentences that include question keywords
+        best_text = clean_text_for_display(hits[0]["text"])
+        sentences = re.split(r'(?<=[\.\?\!])\s+', best_text)
+        q_words = [w.lower() for w in re.findall(r"\w+", question) if len(w) > 2]
+
+        matched = []
+        if q_words:
+            for s in sentences:
+                sl = s.lower()
+                if any(q in sl for q in q_words):
+                    matched.append(s.strip())
+                if len(matched) >= 3:
+                    break
+
+        if not matched:
+            matched = [s.strip() for s in sentences[:3] if s.strip()]
+
+        summary = " • ".join(matched) if matched else best_text[:400]
+        if len(summary) > 400:
+            summary = summary[:397].rstrip() + "..."
 
         return Response({"answer": summary, "hits": hits})
