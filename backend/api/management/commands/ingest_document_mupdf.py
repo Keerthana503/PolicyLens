@@ -7,8 +7,8 @@ import fitz  # PyMuPDF
 from sklearn.feature_extraction.text import TfidfVectorizer
 from scipy import sparse
 
-CHUNK_SIZE = 600
-CHUNK_OVERLAP = 120
+CHUNK_SIZE = 400
+CHUNK_OVERLAP = 50
 MAX_PAGE_CHARS = 100_000
 MAX_FEATURES = 5000
 
