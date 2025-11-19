@@ -1,7 +1,8 @@
-﻿# ingest_document_mupdf_simple.py
+﻿# api/management/commands/ingest_document_mupdf_simple.py
 import os
 import re
 import json
+import pickle
 from django.core.management.base import BaseCommand
 from django.conf import settings
 from api.models import Document
@@ -35,15 +36,20 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
         return []
     chunks = []
     start = 0
+    # safety: ensure overlap < chunk_size
+    if overlap >= chunk_size:
+        overlap = max(1, chunk_size // 4)
     while start < n:
         end = min(start + chunk_size, n)
         chunk = text[start:end].strip()
         if chunk:
             chunks.append(chunk)
-        if end == n:
+        if end >= n:
             break
-        # move start forward with overlap
-        start = max(0, end - overlap)
+        # advance start with overlap
+        start = end - overlap
+        if start < 0:
+            start = 0
     return chunks
 
 
@@ -69,6 +75,8 @@ class Command(BaseCommand):
             pdf = fitz.open(doc.file.path)
             all_chunks = []
             metadata = []  # list of dicts: {doc_id, page, chunk_index, text}
+            global_chunk_index = 0
+
             for p in range(pdf.page_count):
                 page = pdf.load_page(p)
                 text = page.get_text("text") or ""
@@ -84,9 +92,10 @@ class Command(BaseCommand):
                     metadata.append({
                         "doc_id": doc.id,
                         "page": p + 1,
-                        "chunk_index": i,
+                        "chunk_index": global_chunk_index,
                         "text": c
                     })
+                    global_chunk_index += 1
             pdf.close()
 
             if not all_chunks:
@@ -97,7 +106,7 @@ class Command(BaseCommand):
 
             # Fit TF-IDF on chunks (fast for small documents)
             vectorizer = TfidfVectorizer(stop_words="english", max_features=MAX_FEATURES)
-            X = vectorizer.fit_transform(all_chunks)  # sparse matrix
+            X = vectorizer.fit_transform(all_chunks)  # sparse matrix (n_chunks, n_features)
 
             # Save per-document files
             tfidf_dir = os.path.join(settings.BASE_DIR, "tfidf_index")
@@ -107,12 +116,36 @@ class Command(BaseCommand):
             matrix_path = os.path.join(tfidf_dir, f"{base}_matrix.npz")
             vocab_path = os.path.join(tfidf_dir, f"{base}_vocab.json")
             meta_path = os.path.join(tfidf_dir, f"{base}_metadata.json")
+            vect_pkl_path = os.path.join(tfidf_dir, f"{base}_vectorizer.pkl")
 
+            # Save matrix
             sparse.save_npz(matrix_path, X)
+
+            # Save pickled fitted vectorizer (IMPORTANT — used by query view)
+            try:
+                with open(vect_pkl_path, "wb") as vf:
+                    pickle.dump(vectorizer, vf, protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception as e:
+                # warn but continue (vocab.json fallback will exist)
+                self.stderr.write(self.style.WARNING(f"Warning: failed to save pickled vectorizer: {e}"))
+
             # convert numpy ints to native Python ints so JSON can serialize
             vocab_serializable = {k: int(v) for k, v in vectorizer.vocabulary_.items()}
             with open(vocab_path, "w", encoding="utf-8") as vf:
                 json.dump(vocab_serializable, vf, ensure_ascii=False, indent=2)
+            # NEW: save vectorizer pickle (preferred for querying)
+            vect_pkl_path = os.path.join(tfidf_dir, f"{base}_vectorizer.pkl")
+            with open(vect_pkl_path, "wb") as pf:
+                pickle.dump(vectorizer, pf)
+
+            # Save metadata with native ints
+            for m in metadata:
+                if "doc_id" in m:
+                    m["doc_id"] = int(m["doc_id"])
+                if "page" in m:
+                    m["page"] = int(m["page"])
+                if "chunk_index" in m:
+                    m["chunk_index"] = int(m["chunk_index"])
             with open(meta_path, "w", encoding="utf-8") as mf:
                 json.dump(metadata, mf, ensure_ascii=False, indent=2)
 
@@ -123,6 +156,7 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS(f"Saved: {matrix_path}"))
             self.stdout.write(self.style.SUCCESS(f"Saved: {vocab_path}"))
             self.stdout.write(self.style.SUCCESS(f"Saved: {meta_path}"))
+            self.stdout.write(self.style.SUCCESS(f"Saved (pickle): {vect_pkl_path}"))
 
         except Exception as e:
             doc.status = "failed"

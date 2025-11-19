@@ -3,6 +3,7 @@ import os
 import json
 import pickle
 import re
+import unicodedata
 import numpy as np
 from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -29,6 +30,7 @@ except Exception:
 
 _SENTENCE_MODEL = None
 
+
 def get_sentence_model(model_name: str = "all-MiniLM-L6-v2"):
     """
     Return a cached SentenceTransformer instance or None if not installed.
@@ -38,8 +40,10 @@ def get_sentence_model(model_name: str = "all-MiniLM-L6-v2"):
         return _SENTENCE_MODEL
     if SentenceTransformer is None:
         return None
+    # Load to CPU by default; move to GPU in your environment if desired.
     _SENTENCE_MODEL = SentenceTransformer(model_name)
     return _SENTENCE_MODEL
+
 
 # -------------------------
 # Auth views (register / me)
@@ -49,12 +53,14 @@ class RegisterView(generics.CreateAPIView):
     permission_classes = [permissions.AllowAny]
     serializer_class = RegisterSerializer
 
+
 class MeView(generics.RetrieveAPIView):
     serializer_class = UserSerializer
     permission_classes = [permissions.IsAuthenticated]
 
     def get_object(self):
         return self.request.user
+
 
 # -------------------------
 # Documents list & upload
@@ -69,23 +75,38 @@ class DocumentListCreateView(generics.ListCreateAPIView):
     def perform_create(self, serializer):
         serializer.save(owner=self.request.user, status="uploaded")
 
+
 # -------------------------
-# TF-IDF query view (lightweight + optional re-rank)
+# TF-IDF query view (lightweight + optional re-rank + debug)
 # -------------------------
 class QueryTfIdfAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, *args, **kwargs):
-        data = request.data
-        doc_id = data.get("doc_id")
-        question = data.get("question")
+        data = request.data or {}
+        # doc_id might come as int or string
+        doc_id = data.get("doc_id") or request.query_params.get("doc_id")
+        question = data.get("question") or request.query_params.get("question")
+        # debug flag: JSON body field `debug` or query param `debug=1|true`
+        debug_flag = data.get("debug", None) or request.query_params.get("debug", None)
+        debug = False
+        if debug_flag is not None:
+            debug = str(debug_flag).lower() in ("1", "true", "yes", "y")
+
         try:
-            top_k = int(data.get("top_k", 5))
+            top_k = int(data.get("top_k", request.query_params.get("top_k", 5)))
         except Exception:
             top_k = 5
 
         if not doc_id or not question:
-            return Response({"detail": "doc_id and question are required"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": "doc_id and question are required"},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # make doc_id int if possible
+        try:
+            doc_id = int(doc_id)
+        except Exception:
+            return Response({"detail": "doc_id must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
 
         # verify document & ownership
         try:
@@ -105,7 +126,8 @@ class QueryTfIdfAPIView(APIView):
 
         # require at least matrix + metadata
         if not (os.path.exists(matrix_path) and os.path.exists(meta_path)):
-            return Response({"detail": "TF-IDF index for this document is not available. Run ingestion."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({"detail": "TF-IDF index for this document is not available. Run ingestion."},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         # load matrix and metadata
         try:
@@ -113,45 +135,69 @@ class QueryTfIdfAPIView(APIView):
             with open(meta_path, "r", encoding="utf-8") as mf:
                 metadata = json.load(mf)
         except Exception as e:
-            return Response({"detail": f"Failed to load TF-IDF matrix/metadata: {e}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({"detail": f"Failed to load TF-IDF matrix/metadata: {e}"},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        debug_info = {
+            "matrix_shape": None,
+            "vocab_size": None,
+            "vocab_from_pickle": False,
+            "q_vec_shape": None,
+            "top_tfidf_candidates": [],
+        }
+        debug_info["matrix_shape"] = tuple(X.shape)
 
         # -------------------------
-        # Load or require a pickled, fitted vectorizer (important)
+        # Load or construct vectorizer (prefer pickled fitted vectorizer)
         # -------------------------
-        # prefer a pickled fitted vectorizer (keeps idf_ and exact mapping)
         vectorizer = None
+
+        # 1) Try pickled fitted vectorizer first (preferred)
         if os.path.exists(vect_pkl_path):
             try:
                 with open(vect_pkl_path, "rb") as vf:
                     candidate = pickle.load(vf)
-                # sanity: ensure candidate has a vocabulary_ attribute and the feature size matches the matrix
+                # attempt to find vocabulary size from candidate safely
+                cand_vocab_size = None
                 if hasattr(candidate, "vocabulary_"):
-                    cand_size = len(candidate.vocabulary_)
-                    if X.shape[1] == cand_size:
-                        vectorizer = candidate
-                    else:
-                        # stale/incorrect pickle — ignore it
-                        vectorizer = None
+                    cand_vocab_size = len(candidate.vocabulary_)
+                elif hasattr(candidate, "vocabulary"):
+                    cand_vocab_size = len(candidate.vocabulary)
+                # ensure dims match: only accept pickle if feature count == matrix width
+                if cand_vocab_size is not None and cand_vocab_size == X.shape[1]:
+                    vectorizer = candidate
+                    debug_info["vocab_from_pickle"] = True
+                    debug_info["vocab_size"] = cand_vocab_size
                 else:
+                    # incompatible pickle -> ignore (safe fallback)
                     vectorizer = None
-            except Exception:
+                    debug_info["vocab_size"] = cand_vocab_size
+            except Exception as e:
                 vectorizer = None
-                
-        # If no pickle, we still allow fallback to vocab.json but only if it's safe.
+                debug_info["vocab_load_error"] = str(e)
+
+        # 2) Fallback: build vectorizer from vocab.json + fit idf_ on stored chunks
         if vectorizer is None:
             if os.path.exists(vocab_json_path):
                 try:
                     with open(vocab_json_path, "r", encoding="utf-8") as vf:
                         vocab = json.load(vf)
-                    # ensure indices are native ints
+                    # ensure indices are ints
                     vocab = {k: int(v) for k, v in vocab.items()}
-                    # build a vectorizer with exact vocabulary mapping
+                    debug_info["vocab_size"] = len(vocab)
                     vectorizer = TfidfVectorizer(stop_words="english", vocabulary=vocab)
-                    # set idf_ by fitting on stored chunks (fast)
                     texts = [m.get("text", "") for m in metadata]
+                    # fit to produce idf_ (fast for small number of chunks)
                     vectorizer.fit(texts)
+                    # sanity: verify feature count matches matrix
+                    if vectorizer.transform(["test"]).shape[1] != X.shape[1]:
+                        return Response(
+                            {"detail": "Dimension mismatch after building vectorizer from vocab.json. Re-ingest document."},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        )
                 except Exception as e:
-                    return Response({"detail": f"Failed to prepare TF-IDF vectorizer from vocab.json: {e}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                    return Response({"detail": f"Failed to prepare TF-IDF vectorizer from vocab.json: {e}"},
+                                    status=status.HTTP_500_INTERNAL_SERVER_ERROR)
             else:
                 return Response(
                     {"detail": "Pickled vectorizer not found and no vocab.json fallback. Please re-run ingestion for this document."},
@@ -161,6 +207,7 @@ class QueryTfIdfAPIView(APIView):
         # --- sanity check: ensure feature dims match the saved matrix X
         try:
             q_vec = vectorizer.transform([question])   # shape (1, n_features)
+            debug_info["q_vec_shape"] = tuple(q_vec.shape)
         except Exception as e:
             return Response({"detail": f"Failed to vectorize question: {e}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -183,7 +230,6 @@ class QueryTfIdfAPIView(APIView):
         for idx in ranked:
             if scores[idx] <= 0:
                 continue
-            # safe guard index bounds in metadata
             if idx < 0 or idx >= len(metadata):
                 continue
             item = metadata[idx]
@@ -196,6 +242,11 @@ class QueryTfIdfAPIView(APIView):
             if len(hits) >= top_k * 3:
                 break
 
+        debug_info["top_tfidf_candidates"] = [
+            {"idx": int(r), "score": float(scores[r]), "text": (metadata[r]["text"] if r < len(metadata) else "")}
+            for r in ranked[: min(50, ranked.shape[0])]
+        ]
+
         # -------------------------
         # Semantic Re-ranker Stage (optional)
         # -------------------------
@@ -206,13 +257,11 @@ class QueryTfIdfAPIView(APIView):
                 hits = hits[:top_k]
             else:
                 try:
-                    # encode question and candidate texts once
                     question_emb = model.encode(question, convert_to_tensor=True)
                     texts_to_rank = [h["text"] for h in hits]
                     text_embs = model.encode(texts_to_rank, convert_to_tensor=True)
                     sim_scores = util.cos_sim(question_emb, text_embs)[0]
 
-                    # sort by semantic score descending and attach semantic_score
                     if torch is not None:
                         sorted_idx = torch.argsort(sim_scores, descending=True)
                         re_ranked = []
@@ -240,13 +289,25 @@ class QueryTfIdfAPIView(APIView):
                     hits = hits[:top_k]
 
         # ------------------------
-        # Generic answer builder (document-agnostic; no resume special-casing)
+        # Generic answer builder (document-agnostic; avoids returning noise lines)
         # ------------------------
         def clean_text_for_display(s: str) -> str:
             if not s:
                 return ""
+            # normalize unicode forms
+            s = unicodedata.normalize("NFKC", s)
+            # remove (cid:123) style artifacts and control chars
             s = re.sub(r"\(cid:\d+\)", " ", s)
-            s = re.sub(r"[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]+", " ", s)
+            s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]+", " ", s)
+            # minimal noise stripping: emails/urls/handles/phones
+            s = re.sub(r"\S+@\S+\.\S+", " ", s)                      # email
+            s = re.sub(r"https?://\S+|www\.\S+", " ", s)             # urls
+            s = re.sub(r"(github\.com|linkedin\.com)\S*", " ", s, flags=re.I)
+            s = re.sub(r"\b\d{6,}\b", " ", s)                        # long numbers (phone-ish)
+            # join hyphenated line-breaks and normalize newlines to spaces
+            s = re.sub(r"-\s*\n\s*", "", s)
+            s = s.replace("\n", " ")
+            s = re.sub(r"[^\w\s\.,:;'\-()\/#@&]+", " ", s)
             s = re.sub(r"\s+", " ", s).strip()
             return s
 
@@ -257,42 +318,40 @@ class QueryTfIdfAPIView(APIView):
             # build a set of query keywords (ignore very short words)
             q_words = [w.lower() for w in re.findall(r"\w+", question) if len(w) > 2]
 
-            # collect sentence candidates with scores
+            # collect sentence candidates with combined score
             candidates = []
             seen_texts = set()
 
-            for h in hits:
+            for hit_index, h in enumerate(hits):
                 chunk_text = clean_text_for_display(h.get("text", "") or "")
                 if not chunk_text:
                     continue
 
-                # get chunk-level scores (if available)
                 tfidf_score = float(h.get("score", 0.0))
                 semantic_score = float(h.get("semantic_score", 0.0)) if h.get("semantic_score") is not None else 0.0
 
-                # split into sentence-like pieces (works for most docs)
+                # split into sentences (also split on newline-like breaks)
                 sentences = re.split(r'(?<=[\.\?\!\n])\s+', chunk_text)
                 for sent in sentences:
                     sent = sent.strip()
-                    if not sent:
+                    if not sent or len(sent) < 20:
                         continue
-                    # dedupe exact sentence text
+
+                    # basic filters for noisy lines
+                    lower = sent.lower()
+                    if any(token in lower for token in ("github.com", "linkedin.com", "http", "@", "skills:", "cv", "resume")):
+                        continue
+
+                    # dedupe
                     if sent in seen_texts:
                         continue
                     seen_texts.add(sent)
 
-                    # keyword match count (higher is better)
-                    kw_count = sum(1 for q in q_words if q in sent.lower())
+                    sl = sent.lower()
+                    kw_count = sum(1 for q in q_words if q in sl)
 
-                    # basic sentence-length penalty: ignore extremely short meaningless pieces
-                    if len(sent) < 20:
-                        length_penalty = -1.0
-                    else:
-                        length_penalty = 0.0
-
-                    # combine signals into a single score
-                    # weights: keyword count strong, semantic moderate, tfidf small, length penalty
-                    score = (kw_count * 10.0) + (semantic_score * 5.0) + (tfidf_score * 1.0) + length_penalty
+                    # combine signals into a single score:
+                    score = (kw_count * 20.0) + (semantic_score * 5.0) + (tfidf_score * 1.0)
 
                     candidates.append({
                         "score": score,
@@ -300,20 +359,25 @@ class QueryTfIdfAPIView(APIView):
                         "tfidf_score": tfidf_score,
                         "semantic_score": semantic_score,
                         "text": sent,
+                        "hit_index": hit_index,
                     })
 
-            # avoid huge sorts on massive docs (optional safeguard)
+            # safeguard: cap candidates before sorting
             if len(candidates) > 2000:
                 candidates = sorted(candidates, key=lambda c: -c["score"])[:2000]
 
-            # sort candidates by combined score desc, then by length (prefer concise)
             candidates.sort(key=lambda c: (-c["score"], abs(len(c["text"]) - 140)))
 
-            # take top unique sentences (up to 3)
+            # take top unique sentences (up to 3) and prefer diversity across hits
             selected = []
+            selected_hit_idxs = set()
             for c in candidates:
                 t = c["text"]
-                if t not in selected:
+                hidx = c.get("hit_index")
+                if hidx is not None and hidx not in selected_hit_idxs:
+                    selected.append(t)
+                    selected_hit_idxs.add(hidx)
+                elif len(selected) < 3:
                     selected.append(t)
                 if len(selected) >= 3:
                     break
@@ -324,10 +388,19 @@ class QueryTfIdfAPIView(APIView):
                 snippet = top_text[:200].rstrip()
                 answer = snippet + ("..." if len(top_text) > 200 else "")
             else:
-                # join with separators; keep it short
                 answer = " • ".join(selected)
-                if len(answer) > 400:
-                    answer = answer[:397].rstrip() + "..."
+                if len(answer) > 500:
+                    answer = answer[:497].rstrip() + "..."
 
-        # final response
-        return Response({"answer": answer, "hits": hits})
+        resp = {"answer": answer, "hits": hits}
+        if debug:
+            # include some debug info: top candidates and shapes
+            resp["debug"] = debug_info
+            # include the ranked top hits we considered (limited)
+            resp["debug"]["candidates_preview"] = [
+                {"text": (h.get("text")[:300] + ("..." if len(h.get("text","")) > 300 else "")),
+                 "score": h.get("score"), "semantic_score": h.get("semantic_score", None)}
+                for h in hits[: min(50, len(hits))]
+            ]
+
+        return Response(resp)
