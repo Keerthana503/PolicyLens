@@ -1,21 +1,26 @@
-﻿# api/management/commands/ingest_document_mupdf_simple.py
+﻿# backend/api/management/commands/ingest_document_mupdf_simple.py
 import os
 import re
 import json
-import pickle
+import logging
+
 from django.core.management.base import BaseCommand
 from django.conf import settings
+
 from api.models import Document
 
 import fitz  # PyMuPDF
 from sklearn.feature_extraction.text import TfidfVectorizer
 from scipy import sparse
+import pickle
+
+logger = logging.getLogger(__name__)
 
 # Tunable chunking params
 CHUNK_SIZE = 400
 CHUNK_OVERLAP = 50
 MAX_PAGE_CHARS = 200_000
-MAX_FEATURES = 30000  # limit TF-IDF vocab size to avoid huge memory on large corpora
+MAX_FEATURES = 30000  # limit TF-IDF vocab size
 
 
 def clean_text(s: str) -> str:
@@ -36,20 +41,14 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
         return []
     chunks = []
     start = 0
-    # safety: ensure overlap < chunk_size
-    if overlap >= chunk_size:
-        overlap = max(1, chunk_size // 4)
     while start < n:
         end = min(start + chunk_size, n)
         chunk = text[start:end].strip()
         if chunk:
             chunks.append(chunk)
-        if end >= n:
+        if end == n:
             break
-        # advance start with overlap
-        start = end - overlap
-        if start < 0:
-            start = 0
+        start = max(0, end - overlap)
     return chunks
 
 
@@ -67,6 +66,7 @@ class Command(BaseCommand):
             self.stderr.write(self.style.ERROR(f"Document {doc_id} not found"))
             return
 
+        logger.info("Ingesting Document id=%s file=%s", doc.id, doc.file.path)
         self.stdout.write(f"Ingesting Document id={doc.id} file={doc.file.path}")
         doc.status = "processing"
         doc.save()
@@ -75,7 +75,6 @@ class Command(BaseCommand):
             pdf = fitz.open(doc.file.path)
             all_chunks = []
             metadata = []  # list of dicts: {doc_id, page, chunk_index, text}
-            global_chunk_index = 0
 
             for p in range(pdf.page_count):
                 page = pdf.load_page(p)
@@ -83,7 +82,6 @@ class Command(BaseCommand):
                 text = clean_text(text)
                 if not text:
                     continue
-                # guard against huge single-page text (rare)
                 if len(text) > MAX_PAGE_CHARS:
                     text = text[:MAX_PAGE_CHARS]
                 chunks = chunk_text(text)
@@ -92,23 +90,24 @@ class Command(BaseCommand):
                     metadata.append({
                         "doc_id": doc.id,
                         "page": p + 1,
-                        "chunk_index": global_chunk_index,
+                        "chunk_index": i,
                         "text": c
                     })
-                    global_chunk_index += 1
             pdf.close()
 
             if not all_chunks:
-                self.stderr.write(self.style.ERROR("No text extracted from document — nothing to index."))
+                msg = "No text extracted from document — nothing to index."
+                logger.error(msg)
+                self.stderr.write(self.style.ERROR(msg))
                 doc.status = "failed"
                 doc.save()
                 return
 
-            # Fit TF-IDF on chunks (fast for small documents)
+            # Fit TF-IDF on chunks
             vectorizer = TfidfVectorizer(stop_words="english", max_features=MAX_FEATURES)
-            X = vectorizer.fit_transform(all_chunks)  # sparse matrix (n_chunks, n_features)
+            X = vectorizer.fit_transform(all_chunks)  # sparse matrix
 
-            # Save per-document files
+            # Prepare output dir and file paths
             tfidf_dir = os.path.join(settings.BASE_DIR, "tfidf_index")
             os.makedirs(tfidf_dir, exist_ok=True)
 
@@ -116,38 +115,20 @@ class Command(BaseCommand):
             matrix_path = os.path.join(tfidf_dir, f"{base}_matrix.npz")
             vocab_path = os.path.join(tfidf_dir, f"{base}_vocab.json")
             meta_path = os.path.join(tfidf_dir, f"{base}_metadata.json")
-            vect_pkl_path = os.path.join(tfidf_dir, f"{base}_vectorizer.pkl")
+            vect_path = os.path.join(tfidf_dir, f"{base}_vectorizer.pkl")
 
-            # Save matrix
+            # Save artifacts directly (simple, reliable)
             sparse.save_npz(matrix_path, X)
 
-            # Save pickled fitted vectorizer (IMPORTANT — used by query view)
-            try:
-                with open(vect_pkl_path, "wb") as vf:
-                    pickle.dump(vectorizer, vf, protocol=pickle.HIGHEST_PROTOCOL)
-            except Exception as e:
-                # warn but continue (vocab.json fallback will exist)
-                self.stderr.write(self.style.WARNING(f"Warning: failed to save pickled vectorizer: {e}"))
-
-            # convert numpy ints to native Python ints so JSON can serialize
             vocab_serializable = {k: int(v) for k, v in vectorizer.vocabulary_.items()}
             with open(vocab_path, "w", encoding="utf-8") as vf:
                 json.dump(vocab_serializable, vf, ensure_ascii=False, indent=2)
-            # NEW: save vectorizer pickle (preferred for querying)
-            vect_pkl_path = os.path.join(tfidf_dir, f"{base}_vectorizer.pkl")
-            with open(vect_pkl_path, "wb") as pf:
-                pickle.dump(vectorizer, pf)
 
-            # Save metadata with native ints
-            for m in metadata:
-                if "doc_id" in m:
-                    m["doc_id"] = int(m["doc_id"])
-                if "page" in m:
-                    m["page"] = int(m["page"])
-                if "chunk_index" in m:
-                    m["chunk_index"] = int(m["chunk_index"])
             with open(meta_path, "w", encoding="utf-8") as mf:
                 json.dump(metadata, mf, ensure_ascii=False, indent=2)
+
+            with open(vect_path, "wb") as pf:
+                pickle.dump(vectorizer, pf)
 
             doc.status = "ready"
             doc.save()
@@ -156,10 +137,12 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS(f"Saved: {matrix_path}"))
             self.stdout.write(self.style.SUCCESS(f"Saved: {vocab_path}"))
             self.stdout.write(self.style.SUCCESS(f"Saved: {meta_path}"))
-            self.stdout.write(self.style.SUCCESS(f"Saved (pickle): {vect_pkl_path}"))
+            self.stdout.write(self.style.SUCCESS(f"Saved (pickle): {vect_path}"))
+            logger.info("Ingestion complete for document id=%s (chunks=%d)", doc.id, len(all_chunks))
 
         except Exception as e:
             doc.status = "failed"
             doc.save()
+            logger.exception("Ingestion failed for document id=%s: %s", doc.id, e)
             self.stderr.write(self.style.ERROR(f"Ingestion failed: {e}"))
             raise

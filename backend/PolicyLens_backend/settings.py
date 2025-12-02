@@ -142,11 +142,11 @@ SIMPLE_JWT = {
     "ROTATE_REFRESH_TOKENS": False,
 }
 
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",  # React dev server
-]
+#CORS_ALLOWED_ORIGINS = [
+#    "http://localhost:3000",  # React dev server
+#]
 # OR simpler during dev:
-# CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_ALL_ORIGINS = True
 
 import os
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

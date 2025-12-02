@@ -1,0 +1,30 @@
+2025-11-19 16:22:57,615 INFO django.utils.autoreload: Watching for file changes with StatReloader
+2025-11-19 16:23:27,089 WARNING django.request: Not Found: /
+2025-11-19 16:25:20,083 INFO api: Ingesting Document id=2 file=C:\Users\keerthana\OneDrive\Desktop\PolicyLens\backend\media\documents\2025\10\28\resume_0.1.pdf
+2025-11-19 16:25:20,196 INFO api: Ingestion complete for document id=2 (chunks=11)
+2025-11-19 16:25:29,173 INFO api: TFIDF query start: doc=2 user=1 question=What is my education? top_k=5 debug=False
+2025-11-19 16:25:29,174 ERROR django.request: Internal Server Error: /api/query_tfidf/
+2025-11-19 16:39:16,615 INFO api: Ingesting Document id=2 file=C:\Users\keerthana\OneDrive\Desktop\PolicyLens\backend\media\documents\2025\10\28\resume_0.1.pdf
+2025-11-19 16:39:16,734 INFO api: Ingestion complete for document id=2 (chunks=11)
+2025-11-19 16:41:23,810 INFO api: TFIDF query start: doc=2 user=1 question=What is my education? top_k=5 debug=False
+2025-11-19 16:41:23,810 ERROR django.request: Internal Server Error: /api/query_tfidf/
+2025-11-19 17:17:07,344 INFO django.utils.autoreload: C:\Users\keerthana\OneDrive\Desktop\PolicyLens\backend\api\views.py changed, reloading.
+2025-11-19 17:20:09,955 INFO django.utils.autoreload: Watching for file changes with StatReloader
+2025-12-02 15:07:53,768 INFO django.utils.autoreload: Watching for file changes with StatReloader
+2025-12-02 15:09:23,232 WARNING django.request: Not Found: /
+2025-12-02 15:11:04,287 INFO api.views: TFIDF query start: doc=2 user=1 question=What is my education? top_k=5 debug=False
+2025-12-02 15:11:04,287 ERROR django.request: Internal Server Error: /api/query_tfidf/
+2025-12-02 15:18:29,863 INFO api.management.commands.ingest_document_mupdf_simple: Ingesting Document id=2 file=C:\Users\keerthana\OneDrive\Desktop\PolicyLens\backend\media\documents\2025\10\28\resume_0.1.pdf
+2025-12-02 15:18:29,913 INFO api.management.commands.ingest_document_mupdf_simple: Ingestion complete for document id=2 (chunks=11)
+2025-12-02 15:21:06,990 INFO api.views: TFIDF query start: doc=2 user=1 question=What is my education? top_k=5 debug=False
+2025-12-02 15:21:07,006 INFO api.views: Loaded TF-IDF artifacts for doc=2: matrix_shape=(11, 285) metadata_chunks=11
+2025-12-02 15:21:07,015 INFO api.views: Loaded pickled vectorizer for doc=2 vocab_size=285
+2025-12-02 15:21:07,015 INFO api.views: Scored doc=2 question; nonzero_scores=2 total_chunks=11
+2025-12-02 15:21:07,022 INFO sentence_transformers.SentenceTransformer: Use pytorch device_name: cpu
+2025-12-02 15:21:07,022 INFO sentence_transformers.SentenceTransformer: Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2025-12-02 15:21:11,776 INFO api.views: Returning answer for doc=2 user=1 answer_len=500 hits=2 debug=False
+2025-12-02 16:46:38,439 INFO django.utils.autoreload: Watching for file changes with StatReloader
+2025-12-02 16:47:23,358 WARNING django.request: Not Found: /
+2025-12-02 16:47:23,465 WARNING django.request: Not Found: /favicon.ico
+2025-12-02 16:47:25,656 WARNING django.request: Not Found: /
+2025-12-02 16:59:44,459 INFO django.utils.autoreload: C:\Users\keerthana\OneDrive\Desktop\PolicyLens\backend\PolicyLens_backend\settings.py changed, reloading.

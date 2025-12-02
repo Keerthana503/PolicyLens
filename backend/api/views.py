@@ -4,6 +4,7 @@ import json
 import pickle
 import re
 import unicodedata
+import logging
 import numpy as np
 from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -16,6 +17,10 @@ from rest_framework.response import Response
 
 from .serializers import RegisterSerializer, UserSerializer, DocumentSerializer
 from .models import Document
+
+logger = logging.getLogger(__name__)
+
+from api.utils.tfidf_utils import validate_artifacts
 
 # -------------------------
 # Sentence-Transformer (cached) for semantic re-ranking
@@ -116,6 +121,16 @@ class QueryTfIdfAPIView(APIView):
         if doc.owner_id != request.user.id:
             return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
 
+        # log query start
+        logger.info(
+            "TFIDF query start: doc=%s user=%s question=%s top_k=%s debug=%s",
+            doc.id,
+            request.user.id,
+            (question[:140] + "...") if len(question) > 140 else question,
+            top_k,
+            debug,
+        )
+
         # per-document artifact paths
         tfidf_dir = os.path.join(settings.BASE_DIR, "tfidf_index")
         base = f"doc_{doc.id}"
@@ -124,8 +139,19 @@ class QueryTfIdfAPIView(APIView):
         vect_pkl_path = os.path.join(tfidf_dir, f"{base}_vectorizer.pkl")
         meta_path = os.path.join(tfidf_dir, f"{base}_metadata.json")
 
+        # --- Artifact validation (new)
+        from api.utils.tfidf_utils import validate_artifacts
+        ok, reason, details = validate_artifacts(matrix_path, vocab_json_path, vect_pkl_path)
+        if not ok:
+        # if debug mode, include full details
+            if debug:
+                return Response({"detail": f"Artifact error: {reason}", "debug": details}, status=500)
+            else:
+                return Response({"detail": f"TF-IDF index invalid: {reason}"}, status=500)
+
         # require at least matrix + metadata
         if not (os.path.exists(matrix_path) and os.path.exists(meta_path)):
+            logger.error("Missing artifacts for doc=%s (matrix or metadata)", doc.id)
             return Response({"detail": "TF-IDF index for this document is not available. Run ingestion."},
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -135,6 +161,7 @@ class QueryTfIdfAPIView(APIView):
             with open(meta_path, "r", encoding="utf-8") as mf:
                 metadata = json.load(mf)
         except Exception as e:
+            logger.exception("Failed to load TF-IDF matrix/metadata for doc=%s", doc.id)
             return Response({"detail": f"Failed to load TF-IDF matrix/metadata: {e}"},
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -146,6 +173,8 @@ class QueryTfIdfAPIView(APIView):
             "top_tfidf_candidates": [],
         }
         debug_info["matrix_shape"] = tuple(X.shape)
+        logger.info("Loaded TF-IDF artifacts for doc=%s: matrix_shape=%s metadata_chunks=%d",
+                    doc.id, tuple(X.shape), len(metadata))
 
         # -------------------------
         # Load or construct vectorizer (prefer pickled fitted vectorizer)
@@ -168,13 +197,17 @@ class QueryTfIdfAPIView(APIView):
                     vectorizer = candidate
                     debug_info["vocab_from_pickle"] = True
                     debug_info["vocab_size"] = cand_vocab_size
+                    logger.info("Loaded pickled vectorizer for doc=%s vocab_size=%s", doc.id, cand_vocab_size)
                 else:
                     # incompatible pickle -> ignore (safe fallback)
                     vectorizer = None
                     debug_info["vocab_size"] = cand_vocab_size
+                    logger.warning("Ignored pickled vectorizer for doc=%s: pickled_vocab=%s matrix_features=%s",
+                                   doc.id, cand_vocab_size, X.shape[1])
             except Exception as e:
                 vectorizer = None
                 debug_info["vocab_load_error"] = str(e)
+                logger.exception("Error loading pickled vectorizer for doc=%s", doc.id)
 
         # 2) Fallback: build vectorizer from vocab.json + fit idf_ on stored chunks
         if vectorizer is None:
@@ -191,14 +224,18 @@ class QueryTfIdfAPIView(APIView):
                     vectorizer.fit(texts)
                     # sanity: verify feature count matches matrix
                     if vectorizer.transform(["test"]).shape[1] != X.shape[1]:
+                        logger.error("Dimension mismatch after building vectorizer from vocab.json for doc=%s", doc.id)
                         return Response(
                             {"detail": "Dimension mismatch after building vectorizer from vocab.json. Re-ingest document."},
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
                         )
+                    logger.info("Built vectorizer from vocab.json for doc=%s vocab_size=%s", doc.id, len(vocab))
                 except Exception as e:
+                    logger.exception("Failed to build vectorizer from vocab.json for doc=%s", doc.id)
                     return Response({"detail": f"Failed to prepare TF-IDF vectorizer from vocab.json: {e}"},
                                     status=status.HTTP_500_INTERNAL_SERVER_ERROR)
             else:
+                logger.error("No pickled vectorizer and no vocab.json for doc=%s", doc.id)
                 return Response(
                     {"detail": "Pickled vectorizer not found and no vocab.json fallback. Please re-run ingestion for this document."},
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -208,10 +245,14 @@ class QueryTfIdfAPIView(APIView):
         try:
             q_vec = vectorizer.transform([question])   # shape (1, n_features)
             debug_info["q_vec_shape"] = tuple(q_vec.shape)
+            logger.debug("Question vectorized for doc=%s q_vec_shape=%s", doc.id, tuple(q_vec.shape))
         except Exception as e:
+            logger.exception("Failed to vectorize question for doc=%s", doc.id)
             return Response({"detail": f"Failed to vectorize question: {e}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         if q_vec.shape[1] != X.shape[1]:
+            logger.error("Dimension mismatch for doc=%s: q_vec_features=%s matrix_features=%s",
+                         doc.id, q_vec.shape[1], X.shape[1])
             return Response(
                 {"detail": f"Dimension mismatch: question vector has {q_vec.shape[1]} features but TF-IDF matrix has {X.shape[1]} features. Re-ingest the document to regenerate matching artifacts."},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -221,7 +262,11 @@ class QueryTfIdfAPIView(APIView):
         try:
             scores = (q_vec.dot(X.T)).toarray()[0]
         except Exception as e:
+            logger.exception("Failed to compute TF-IDF scores for doc=%s", doc.id)
             return Response({"detail": f"Failed to compute scores: {e}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        nonzero = int((scores > 0).sum())
+        logger.info("Scored doc=%s question; nonzero_scores=%d total_chunks=%d", doc.id, nonzero, X.shape[0])
 
         ranked = np.argsort(-scores)
 
@@ -243,7 +288,8 @@ class QueryTfIdfAPIView(APIView):
                 break
 
         debug_info["top_tfidf_candidates"] = [
-            {"idx": int(r), "score": float(scores[r]), "text": (metadata[r]["text"] if r < len(metadata) else "")}
+            {"idx": int(r), "score": float(scores[r]),
+             "text": (metadata[r]["text"] if r < len(metadata) else "")}
             for r in ranked[: min(50, ranked.shape[0])]
         ]
 
@@ -285,7 +331,7 @@ class QueryTfIdfAPIView(APIView):
                             re_ranked.append(h)
                         hits = re_ranked[:top_k]
                 except Exception:
-                    # on any failure during re-rank, fall back to TF-IDF hits
+                    logger.exception("Semantic re-rank failed for doc=%s — falling back to TF-IDF hits", doc.id)
                     hits = hits[:top_k]
 
         # ------------------------
@@ -396,11 +442,15 @@ class QueryTfIdfAPIView(APIView):
         if debug:
             # include some debug info: top candidates and shapes
             resp["debug"] = debug_info
-            # include the ranked top hits we considered (limited)
             resp["debug"]["candidates_preview"] = [
                 {"text": (h.get("text")[:300] + ("..." if len(h.get("text","")) > 300 else "")),
                  "score": h.get("score"), "semantic_score": h.get("semantic_score", None)}
                 for h in hits[: min(50, len(hits))]
             ]
+
+        logger.info("Returning answer for doc=%s user=%s answer_len=%d hits=%d debug=%s",
+                    doc.id, request.user.id, len(answer or ""), len(hits), debug)
+        if debug:
+            logger.debug("Debug info for doc=%s: %s", doc.id, json.dumps(debug_info, default=str)[:2000])
 
         return Response(resp)
